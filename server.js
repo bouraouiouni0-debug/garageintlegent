@@ -1,0 +1,215 @@
+// Serveur cloud ESP32-CAM : photo + streaming (MJPEG) + texte dans les 2 sens
+// + mot de passe demande a chaque ouverture de la page (modifiable depuis la page)
+// + notifications push quand on appuie sur le bouton de l'ESP32
+const express = require("express");
+const crypto = require("crypto");
+const path = require("path");
+const webpush = require("web-push");
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.API_KEY || "";                  // optionnel : cle pour l'ESP32
+let webPassword = process.env.WEB_PASSWORD || "12345678";   // mot de passe de la page (defaut 12345678)
+
+// ===== NOTIFICATIONS PUSH (cles VAPID : variables d'environnement sur Render) =====
+const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY || "";
+const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || "";
+if (VAPID_PUBLIC && VAPID_PRIVATE) {
+  webpush.setVapidDetails("mailto:admin@example.com", VAPID_PUBLIC, VAPID_PRIVATE);
+} else {
+  console.log("ATTENTION : VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY manquantes, pas de notifications");
+}
+const subs = new Map();   // appareils abonnes aux notifications (endpoint -> abonnement)
+let lastButton = 0;
+
+// ===== ETAT =====
+let pendingPhoto = false;
+let streaming = false;
+let streamStart = 0;
+let lastPhoto = null;
+let photoVersion = 0;
+let lastSeen = 0;
+const viewers = new Set();
+
+let pendingText = null;   // texte page web -> ESP32
+let messages = [];        // textes ESP32 -> page web
+let msgId = 0;
+
+const tokens = new Set(); // sessions ouvertes (en memoire : vides a chaque redemarrage)
+
+// ===== SECURITE =====
+function deviceAuth(req, res, next) {
+  if (!API_KEY || req.get("x-api-key") === API_KEY) return next();
+  res.status(401).json({ error: "cle invalide" });
+}
+
+function webAuth(req, res, next) {
+  const token = req.get("x-token") || req.query.token;
+  if (token && tokens.has(token)) return next();
+  res.status(401).json({ error: "connexion requise" });
+}
+
+// ===== ROUTES POUR L'ESP32 (sans mot de passe de page) =====
+const rawJpeg = express.raw({ type: "image/jpeg", limit: "3mb" });
+const rawText = express.text({ type: "text/plain", limit: "10kb" });
+
+// L'ESP32 demande s'il doit agir
+app.get("/api/poll", deviceAuth, (req, res) => {
+  lastSeen = Date.now();
+  const photo = pendingPhoto;
+  const text = pendingText;
+  pendingPhoto = false;
+  pendingText = null; // livre une seule fois
+  res.json({ photo, stream: streaming, text });
+});
+
+// L'ESP32 envoie une photo
+app.post("/api/photo", deviceAuth, rawJpeg, (req, res) => {
+  lastSeen = Date.now();
+  if (Buffer.isBuffer(req.body) && req.body.length > 0) {
+    lastPhoto = req.body;
+    photoVersion++;
+  }
+  res.json({ ok: true });
+});
+
+// L'ESP32 envoie une image du streaming
+app.post("/api/frame", deviceAuth, rawJpeg, (req, res) => {
+  lastSeen = Date.now();
+  if (Date.now() - streamStart > 10 * 60 * 1000) streaming = false; // securite : 10 min max
+  const buf = req.body;
+  if (Buffer.isBuffer(buf) && buf.length > 0) {
+    for (const v of viewers) {
+      v.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${buf.length}\r\n\r\n`);
+      v.write(buf);
+      v.write("\r\n");
+    }
+  }
+  res.json({ stream: streaming });
+});
+
+// L'ESP32 envoie un texte
+app.post("/api/data", deviceAuth, rawText, (req, res) => {
+  lastSeen = Date.now();
+  const t = typeof req.body === "string" ? req.body.trim().slice(0, 500) : "";
+  if (t) {
+    messages.push({ id: ++msgId, text: t, time: Date.now() });
+    if (messages.length > 50) messages.shift();
+  }
+  res.json({ ok: true });
+});
+
+// L'ESP32 signale un appui sur le bouton -> notification sur tous les telephones abonnes
+app.post("/api/button", deviceAuth, async (req, res) => {
+  lastSeen = Date.now();
+  if (Date.now() - lastButton < 3000) return res.json({ ok: true, skipped: true }); // anti-rebond
+  lastButton = Date.now();
+  messages.push({ id: ++msgId, text: "Bouton appuye !", time: Date.now() });
+  if (messages.length > 50) messages.shift();
+
+  let sent = 0;
+  if (VAPID_PUBLIC && VAPID_PRIVATE) {
+    const payload = JSON.stringify({ title: "ESP32-CAM", body: "Bouton appuye !", time: Date.now() });
+    await Promise.all([...subs.values()].map((sub) =>
+      webpush.sendNotification(sub, payload, { TTL: 60, urgency: "high" })
+        .then(() => { sent++; })
+        .catch((err) => {
+          if (err.statusCode === 404 || err.statusCode === 410) subs.delete(sub.endpoint); // abonnement mort
+          else console.log("Erreur push :", err.statusCode || err.message);
+        })
+    ));
+  }
+  console.log("Bouton -> notifications envoyees : " + sent + "/" + subs.size);
+  res.json({ ok: true, sent });
+});
+
+// ===== PAGE WEB + CONNEXION (la page elle-meme est publique, ses donnees non) =====
+app.use(express.json());
+app.use(express.static(path.join(__dirname, "public")));
+
+app.post("/api/login", (req, res) => {
+  const p = String((req.body && req.body.password) || "").trim();
+  if (p === webPassword) {
+    const token = crypto.randomBytes(24).toString("hex");
+    tokens.add(token);
+    if (tokens.size > 50) tokens.delete(tokens.values().next().value);
+    return res.json({ token });
+  }
+  setTimeout(() => res.status(401).json({ error: "mot de passe incorrect" }), 1000); // freine les essais
+});
+
+// ===== ROUTES PROTEGEES (jeton obligatoire) =====
+app.use(webAuth);
+
+app.post("/api/command", (req, res) => {
+  const cmd = req.body && req.body.cmd;
+  if (cmd === "photo") pendingPhoto = true;
+  else if (cmd === "stream-start") { streaming = true; streamStart = Date.now(); }
+  else if (cmd === "stream-stop") streaming = false;
+  else return res.status(400).json({ error: "commande inconnue" });
+  res.json({ ok: true });
+});
+
+// Notifications : cle publique + enregistrement du telephone
+app.get("/api/vapid-key", (req, res) => res.json({ key: VAPID_PUBLIC }));
+app.post("/api/subscribe", (req, res) => {
+  const sub = req.body;
+  if (!sub || !sub.endpoint) return res.status(400).json({ error: "abonnement invalide" });
+  subs.set(sub.endpoint, sub);
+  res.json({ ok: true, devices: subs.size });
+});
+
+// Page web -> ESP32 (texte)
+app.post("/api/text", (req, res) => {
+  const t = String((req.body && req.body.text) || "").trim().slice(0, 200);
+  if (!t) return res.status(400).json({ error: "texte vide" });
+  pendingText = t;
+  res.json({ ok: true });
+});
+
+// Changer le mot de passe (toutes les sessions sont fermees)
+app.post("/api/password", (req, res) => {
+  const p = String((req.body && req.body.password) || "").trim();
+  if (p.length < 4 || p.length > 64) {
+    return res.status(400).json({ error: "4 a 64 caracteres" });
+  }
+  webPassword = p;
+  tokens.clear();
+  res.json({ ok: true });
+});
+
+// ESP32 -> page web (lecture des messages)
+app.get("/api/messages", (req, res) => {
+  const since = Number(req.query.since) || 0;
+  res.json(messages.filter(m => m.id > since));
+});
+
+app.get("/api/status", (req, res) => {
+  res.json({
+    online: Date.now() - lastSeen < 8000,
+    streaming,
+    photoVersion,
+    hasPhoto: !!lastPhoto,
+  });
+});
+
+app.get("/api/photo/latest", (req, res) => {
+  if (!lastPhoto) return res.status(404).send("Aucune photo");
+  res.set({ "Content-Type": "image/jpeg", "Cache-Control": "no-store" });
+  res.send(lastPhoto);
+});
+
+app.get("/stream", (req, res) => {
+  res.writeHead(200, {
+    "Content-Type": "multipart/x-mixed-replace; boundary=frame",
+    "Cache-Control": "no-store",
+    Connection: "keep-alive",
+  });
+  viewers.add(res);
+  req.on("close", () => {
+    viewers.delete(res);
+    if (viewers.size === 0) streaming = false; // plus personne ne regarde
+  });
+});
+
+app.listen(PORT, () => console.log("Serveur demarre sur le port " + PORT));
