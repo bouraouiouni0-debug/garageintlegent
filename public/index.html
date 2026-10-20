@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ma camera ESP32-CAM</title>
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#1565c0">
+  <style>
+    body { font-family: Arial, sans-serif; background: #eef2f7; color: #1f2937; text-align: center; padding: 25px 12px; margin: 0; }
+    .container { max-width: 700px; margin: 20px auto; padding: 24px; background: white; border-radius: 18px; box-shadow: 0 5px 20px #00000012; }
+    h1 { color: #1565c0; }
+    button { background: #1565c0; color: white; border: none; padding: 15px 26px; margin: 4px; font-size: 18px; font-weight: bold; border-radius: 10px; cursor: pointer; }
+    button.stop { background: #c62828; }
+    button:disabled { opacity: .6; cursor: wait; }
+    img { display: block; width: 100%; height: auto; margin-top: 22px; border-radius: 12px; }
+    #status { color: #475569; min-height: 24px; }
+    #online { font-size: 14px; font-weight: bold; }
+    .hidden { display: none !important; }
+
+    h2 { color: #1565c0; font-size: 20px; margin: 28px 0 10px; }
+    #txt, #newPass, #loginPass { width: 60%; padding: 14px; font-size: 18px; border: 1px solid #cbd5e1; border-radius: 10px; }
+    #loginPass { width: 80%; max-width: 300px; }
+    #txtMsg, #passMsg, #loginMsg { display: block; min-height: 24px; color: #475569; margin-top: 6px; }
+    #loginMsg { color: #c62828; }
+    #rxBox { height: 200px; overflow-y: auto; text-align: left; border: 1px solid #cbd5e1; border-radius: 10px; padding: 8px; font-family: monospace; font-size: 15px; background: #f8fafc; }
+  </style>
+</head>
+<body>
+  <!-- ===== ECRAN DE CONNEXION (affiche a chaque ouverture / actualisation) ===== -->
+  <div id="login" class="container" style="max-width:420px; margin-top:80px;">
+    <h1>ESP32-CAM</h1>
+    <h2 style="margin-top:10px;">Mot de passe</h2>
+    <input id="loginPass" type="password" autocomplete="off" placeholder="Mot de passe" onkeydown="if(event.key==='Enter') doLogin()">
+    <br>
+    <button id="loginBtn" onclick="doLogin()">Entrer</button>
+    <span id="loginMsg"></span>
+  </div>
+
+  <!-- ===== APPLICATION (cachee tant que le mot de passe n'est pas bon) ===== -->
+  <div id="app" class="container hidden">
+    <h1>ESP32-CAM</h1>
+    <p id="online">Camera : ...</p>
+    <button id="take" onclick="takePhoto()">Take photo</button>
+    <button id="stream" onclick="toggleStream()">Take streaming</button>
+    <p id="status">Pret</p>
+    <img id="view" class="hidden" alt="Image de la camera">
+
+    <h2>Envoyer un texte a l'ESP32</h2>
+    <input id="txt" type="text" maxlength="200" placeholder="Ecris un mot..." onkeydown="if(event.key==='Enter') sendText()">
+    <button id="sendTxt" onclick="sendText()">Envoyer</button>
+    <span id="txtMsg"></span>
+
+    <h2>Donnees recues de l'ESP32</h2>
+    <div id="rxBox"></div>
+
+    <h2>Notifications</h2>
+    <button id="notifBtn" onclick="enableNotif(true)">Activer les notifications</button>
+    <span id="notifMsg" style="display:block; min-height:24px; color:#475569; margin-top:6px;"></span>
+
+    <h2>Changer le mot de passe</h2>
+    <input id="newPass" type="text" maxlength="64" autocomplete="off" placeholder="Nouveau mot de passe" onkeydown="if(event.key==='Enter') changePassword()">
+    <button id="passBtn" onclick="changePassword()">Changer</button>
+    <span id="passMsg"></span>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    let streaming = false;
+    let token = "";          // garde en memoire seulement : disparait a chaque actualisation
+    $("loginPass").focus();
+
+    // ===== CONNEXION =====
+    async function doLogin() {
+      const password = $("loginPass").value;
+      if (!password) return;
+      $("loginBtn").disabled = true;
+      $("loginMsg").textContent = "";
+      try {
+        const r = await fetch("/api/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password }),
+        });
+        if (!r.ok) throw new Error("Mot de passe incorrect");
+        token = (await r.json()).token;
+        $("loginPass").value = "";
+        $("login").classList.add("hidden");
+        $("app").classList.remove("hidden");
+        startApp();
+      } catch (e) {
+        $("loginMsg").textContent = e.message;
+        $("loginPass").select();
+      } finally {
+        $("loginBtn").disabled = false;
+      }
+    }
+
+    // ===== OUTILS =====
+    async function api(path, opts) {
+      opts = opts || {};
+      opts.headers = Object.assign({}, opts.headers, { "x-token": token });
+      const r = await fetch(path, opts);
+      if (r.status === 401) { location.reload(); throw new Error("Session expiree"); }
+      if (!r.ok) throw new Error("Erreur HTTP " + r.status);
+      return r;
+    }
+    const getStatus = async () => (await api("/api/status")).json();
+    const cmd = (c) => api("/api/command", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cmd: c }),
+    });
+    const msg = (t) => ($("status").textContent = t);
+    function show(src) { $("view").src = src; $("view").classList.remove("hidden"); }
+
+    // ===== PHOTO =====
+    async function takePhoto() {
+      $("take").disabled = true;
+      try {
+        const before = (await getStatus()).photoVersion;
+        await cmd("photo");
+        msg("Capture en cours...");
+        for (let i = 0; i < 30; i++) {
+          await sleep(500);
+          const s = await getStatus();
+          if (s.photoVersion > before) {
+            show("/api/photo/latest?v=" + s.photoVersion + "&token=" + token);
+            msg("Photo prise avec succes !");
+            return;
+          }
+        }
+        throw new Error("la camera ne repond pas (hors ligne ?)");
+      } catch (e) {
+        msg("Erreur : " + e.message);
+      } finally {
+        $("take").disabled = false;
+      }
+    }
+
+    // ===== STREAMING =====
+    async function toggleStream() {
+      try {
+        if (!streaming) {
+          await cmd("stream-start");
+          streaming = true;
+          $("stream").textContent = "Stop streaming";
+          $("stream").classList.add("stop");
+          $("take").disabled = true;
+          msg("Demarrage du streaming (2 a 3 secondes)...");
+          show("/stream?t=" + Date.now() + "&token=" + token);
+        } else {
+          await cmd("stream-stop");
+          streaming = false;
+          $("view").removeAttribute("src");
+          $("view").classList.add("hidden");
+          $("stream").textContent = "Take streaming";
+          $("stream").classList.remove("stop");
+          $("take").disabled = false;
+          msg("Streaming arrete.");
+        }
+      } catch (e) {
+        msg("Erreur : " + e.message);
+      }
+    }
+
+    // ===== ETAT EN LIGNE =====
+    async function refreshOnline() {
+      try {
+        const s = await getStatus();
+        $("online").textContent = s.online ? "Camera : en ligne" : "Camera : hors ligne";
+        $("online").style.color = s.online ? "#2e7d32" : "#c62828";
+      } catch (e) {
+        $("online").textContent = "Serveur injoignable";
+      }
+    }
+
+    // ===== ENVOYER UN TEXTE A L'ESP32 =====
+    async function sendText() {
+      const text = $("txt").value.trim();
+      if (!text) return;
+      $("sendTxt").disabled = true;
+      try {
+        await api("/api/text", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+        $("txtMsg").textContent = "Envoye : " + text;
+        $("txt").value = "";
+      } catch (e) {
+        $("txtMsg").textContent = "Erreur : " + e.message;
+      } finally {
+        $("sendTxt").disabled = false;
+      }
+    }
+
+    // ===== RECEVOIR LES TEXTES DE L'ESP32 =====
+    let lastMsgId = 0;
+    async function fetchMessages() {
+      try {
+        const list = await (await api("/api/messages?since=" + lastMsgId)).json();
+        const box = $("rxBox");
+        for (const m of list) {
+          const line = document.createElement("div");
+          line.textContent = new Date(m.time).toLocaleTimeString() + "  " + m.text;
+          box.appendChild(line);
+          lastMsgId = m.id;
+        }
+        if (list.length) box.scrollTop = box.scrollHeight;
+      } catch (e) {}
+    }
+
+    // ===== CHANGER LE MOT DE PASSE =====
+    async function changePassword() {
+      const password = $("newPass").value.trim();
+      if (password.length < 4) {
+        $("passMsg").textContent = "Minimum 4 caracteres";
+        return;
+      }
+      $("passBtn").disabled = true;
+      try {
+        await api("/api/password", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password }),
+        });
+        $("passMsg").textContent = "Mot de passe change. Reconnexion...";
+        setTimeout(() => location.reload(), 1500); // retour a l'ecran de connexion
+      } catch (e) {
+        $("passMsg").textContent = "Erreur : " + e.message;
+        $("passBtn").disabled = false;
+      }
+    }
+
+    // ===== NOTIFICATIONS PUSH =====
+    function b64ToUint8(b) {
+      const s = (b + "=".repeat((4 - (b.length % 4)) % 4)).replace(/-/g, "+").replace(/_/g, "/");
+      return Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+    }
+    async function enableNotif(manual) {
+      const m = $("notifMsg");
+      if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
+        m.textContent = "Non supporte ici. Sur iPhone : Partager > Sur l'ecran d'accueil, puis ouvrir l'app.";
+        return;
+      }
+      try {
+        const perm = manual ? await Notification.requestPermission() : Notification.permission;
+        if (perm !== "granted") { if (manual) m.textContent = "Notifications refusees dans le navigateur."; return; }
+        const reg = await navigator.serviceWorker.register("/sw.js");
+        await navigator.serviceWorker.ready;
+        const { key } = await (await api("/api/vapid-key")).json();
+        if (!key) throw new Error("cles VAPID absentes sur le serveur");
+        const sub = (await reg.pushManager.getSubscription()) ||
+          (await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToUint8(key) }));
+        await api("/api/subscribe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(sub),
+        });
+        m.textContent = "Notifications activees sur cet appareil.";
+        $("notifBtn").textContent = "Notifications activees";
+      } catch (e) {
+        m.textContent = "Erreur : " + e.message;
+      }
+    }
+    // Bip quand la page est ouverte (le son des notifications telephone est gere par Android/iOS)
+    function beep() {
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const o = ctx.createOscillator(); o.frequency.value = 1000; o.connect(ctx.destination);
+        o.start(); setTimeout(() => { o.stop(); ctx.close(); }, 250);
+      } catch (e) {}
+    }
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.addEventListener("message", (e) => { if (e.data === "beep") beep(); });
+    }
+
+    // ===== DEMARRAGE APRES CONNEXION =====
+    function startApp() {
+      enableNotif(false); // se reabonne automatiquement si deja autorise
+      refreshOnline();
+      setInterval(refreshOnline, 3000);
+      setInterval(fetchMessages, 1000);
+    }
+  </script>
+</body>
+</html>
